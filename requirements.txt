@@ -1,5 +1,4 @@
-streamlit==1.39.0
-google-genai==0.3.0
-sentence-transformers==3.3.1
-chromadb==0.5.23
-protobuf==4.25.5
+streamlit
+google-genai
+sentence-transformers
+chromadb
