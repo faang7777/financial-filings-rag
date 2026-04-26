@@ -2,7 +2,7 @@
 
 A Retrieval-Augmented Generation (RAG) application that answers natural-language questions about SEC 10-K filings for Apple, Microsoft, and Tesla — with source citations.
 
-🔗 **[Live demo](https://[your-streamlit-url].streamlit.app)**
+🔗 **[Live demo](https://financial-filings-rag-5abzxh6bxljq8taxzwfvyd.streamlit.app/)**
 
 ![Demo screenshot](demo.png)
 
