@@ -1,6 +1,6 @@
 import streamlit as st
 import json
-import chromadb
+import numpy as np
 from sentence_transformers import SentenceTransformer
 from google import genai
 
@@ -14,46 +14,24 @@ st.set_page_config(
 st.title("📊 Financial Filings Q&A Assistant")
 st.caption("Ask questions about Apple, Microsoft, and Tesla 10-K filings")
 
-# ---------- Load resources (cached so this runs only once) ----------
+# ---------- Cached resource loading ----------
 @st.cache_resource
 def load_embedder():
     return SentenceTransformer('all-MiniLM-L6-v2')
 
 @st.cache_resource
-def load_vector_db():
-    """Load chunks from JSON and build ChromaDB collection."""
+def load_data():
+    """Load pre-computed chunks and embeddings."""
     with open('chunks.json', 'r') as f:
-        all_chunks = json.load(f)
+        chunks = json.load(f)
     
-    embedder = load_embedder()
+    embeddings = np.load('embeddings.npy')
     
-    # Build vector DB in memory
-    client = chromadb.Client()
-    try:
-        client.delete_collection("filings")
-    except:
-        pass
-    collection = client.create_collection(name="filings")
+    # Normalize for cosine similarity (faster lookups later)
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    embeddings_normalized = embeddings / norms
     
-    # Embed and add in batches
-    texts = [c["text"] for c in all_chunks]
-    
-    progress_bar = st.progress(0, text="Building vector database (one-time setup)...")
-    embeddings = embedder.encode(texts, batch_size=64, show_progress_bar=False)
-    progress_bar.progress(50, text="Storing vectors...")
-    
-    batch_size = 5000
-    for i in range(0, len(all_chunks), batch_size):
-        end = min(i + batch_size, len(all_chunks))
-        collection.add(
-            embeddings=[e.tolist() for e in embeddings[i:end]],
-            documents=texts[i:end],
-            metadatas=[{"ticker": c["ticker"]} for c in all_chunks[i:end]],
-            ids=[c["chunk_id"] for c in all_chunks[i:end]]
-        )
-    
-    progress_bar.empty()
-    return collection
+    return chunks, embeddings_normalized
 
 @st.cache_resource
 def load_gemini():
@@ -70,25 +48,40 @@ def detect_company(question):
     }
     return [t for t, kws in keywords.items() if any(kw in question_lower for kw in kws)]
 
-def ask_question(question, n_chunks=8):
+def search_chunks(question, n_chunks=8):
+    """Find most relevant chunks using cosine similarity."""
     embedder = load_embedder()
-    collection = load_vector_db()
-    client = load_gemini()
+    chunks, embeddings = load_data()
     
+    # Embed the question and normalize
+    q_emb = embedder.encode([question])[0]
+    q_emb = q_emb / np.linalg.norm(q_emb)
+    
+    # Detect company filter
     detected = detect_company(question)
-    q_embedding = embedder.encode([question])[0].tolist()
     
     if detected:
-        where = {"ticker": {"$in": detected}} if len(detected) > 1 else {"ticker": detected[0]}
-        results = collection.query(query_embeddings=[q_embedding], n_results=n_chunks, where=where)
+        # Filter by ticker first
+        mask = np.array([c["ticker"] in detected for c in chunks])
+        valid_indices = np.where(mask)[0]
+        valid_embeddings = embeddings[valid_indices]
+        
+        # Cosine similarity (dot product since normalized)
+        scores = valid_embeddings @ q_emb
+        top_local = np.argsort(scores)[-n_chunks:][::-1]
+        top_indices = valid_indices[top_local]
     else:
-        results = collection.query(query_embeddings=[q_embedding], n_results=n_chunks)
+        scores = embeddings @ q_emb
+        top_indices = np.argsort(scores)[-n_chunks:][::-1]
     
-    chunks = results['documents'][0]
-    metas = results['metadatas'][0]
+    return [chunks[i] for i in top_indices]
+
+def ask_question(question, n_chunks=8):
+    client = load_gemini()
+    relevant = search_chunks(question, n_chunks)
     
     context = "\n\n---\n\n".join([
-        f"[Source: {m['ticker']} 10-K]\n{c}" for c, m in zip(chunks, metas)
+        f"[Source: {c['ticker']} 10-K]\n{c['text']}" for c in relevant
     ])
     
     prompt = f"""You are a financial analyst assistant. Answer the question using ONLY the context below from SEC 10-K filings.
@@ -106,7 +99,7 @@ ANSWER:"""
         model="gemini-2.5-flash-lite",
         contents=prompt
     )
-    return response.text, chunks, metas
+    return response.text, relevant
 
 # ---------- UI ----------
 with st.sidebar:
@@ -120,13 +113,12 @@ with st.sidebar:
     - 🚗 Tesla (TSLA)
     
     **Tech stack:**
-    - Embeddings: sentence-transformers
-    - Vector DB: ChromaDB
+    - Embeddings: sentence-transformers (MiniLM-L6-v2)
+    - Vector search: NumPy cosine similarity
     - LLM: Gemini 2.5 Flash-Lite
     - Source: SEC EDGAR
     """)
 
-# Sample questions
 st.subheader("Try a sample question:")
 samples = [
     "What were Apple's total revenues in the most recent fiscal year?",
@@ -140,7 +132,6 @@ for i, sample in enumerate(samples):
     if cols[i % 2].button(sample, key=f"sample_{i}", use_container_width=True):
         st.session_state['question'] = sample
 
-# Question input
 question = st.text_input(
     "Or ask your own question:",
     value=st.session_state.get('question', ''),
@@ -148,17 +139,17 @@ question = st.text_input(
 )
 
 if st.button("Get Answer", type="primary") and question:
-    with st.spinner("Retrieving relevant filings and generating answer..."):
+    with st.spinner("Searching filings and generating answer..."):
         try:
-            answer, chunks, metas = ask_question(question)
+            answer, sources = ask_question(question)
             
             st.subheader("Answer")
             st.write(answer)
             
             with st.expander("📚 Show source chunks used"):
-                for i, (c, m) in enumerate(zip(chunks, metas)):
-                    st.markdown(f"**Chunk {i+1} — {m['ticker']} 10-K**")
-                    st.text(c[:500] + "..." if len(c) > 500 else c)
+                for i, c in enumerate(sources):
+                    st.markdown(f"**Chunk {i+1} — {c['ticker']} 10-K**")
+                    st.text(c['text'][:500] + "..." if len(c['text']) > 500 else c['text'])
                     st.divider()
         except Exception as e:
             st.error(f"Error: {e}")
